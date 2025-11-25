@@ -52,67 +52,89 @@ local lcov_parser = function(path, files)
     --- @type FileCoverage|nil
     local cmeta = nil
 
-    for _, line in ipairs(path:readlines()) do
-        if line:match("end_of_record") and cmeta ~= nil and cfile ~= nil then
-            -- Commit the current file
-            cmeta.summary["excluded_lines"] = 0
-            cmeta.summary["percent_covered"] = cmeta.summary.covered_lines / cmeta.summary.num_statements * 100
-            files[cfile] = cmeta
-            -- Reset variables
-            cfile = nil
-            cmeta = nil
-        elseif line:match("SF:.+") then
-            -- SF:<absolute path to the source file>
-            cfile = line:gsub("SF:", "")
-            cmeta = M.new_file_meta()
-        elseif line:match("^DA:%d+,%d+,?.*") and cmeta ~= nil then
-            -- DA:<line number>,<execution count>[,<checksum>]
-            local ls, ns = line:match("DA:(%d+),(%d+),?.*")
-            local l, n = tonumber(ls, 10), tonumber(ns, 10)
-            if n > 0 then
-                table.insert(cmeta.executed_lines, l)
-            else
-                table.insert(cmeta.missing_lines, l)
-                cmeta.summary.missing_lines = cmeta.summary.missing_lines + 1
+    -- Find all instances of the subpath within cwd using fd
+    local fd_command = "fd --no-ignore -t f --full-path " .. path.filename
+    local fd_output = vim.fn.systemlist(fd_command)
+    if #fd_output > 0 then
+        -- Parse each instance of the subpath
+        for _, file_path in ipairs(fd_output) do
+            -- Read the lcov.info file
+            local file = Path:new(Path:new(file_path):absolute())
+            local path_components = vim.split(path.filename, path._sep)
+            local parent_path = file
+            for i = 1, #path_components do
+                parent_path = parent_path:parent()
             end
-        elseif line:match("^BRDA:%d+,%d+,%d+,(%d+|-)") and cmeta ~= nil then
-            -- BRDA:<line number>,<block number>,<branch number>,<taken>
-            -- Block number and branch number are gcc internal IDs for the branch.
-            -- Taken is either '-' if the basic block containing the branch was never
-            -- executed or a number indicating how often that branch was taken.
-            local ls, ns = line:match("^BRDA:(%d+),%d+,%d+,(%d+|-)")
-            local l = tonumber(ls, 10)
-            --- @type integer?
-            local n = 0
-            if ns ~= '-' then
-                n = tonumber(ns, 10)
+            for _, line in ipairs(file:readlines()) do
+                if line:match("end_of_record") and cmeta ~= nil and cfile ~= nil then
+                    -- Commit the current file
+                    cmeta.summary["excluded_lines"] = 0
+                    cmeta.summary["percent_covered"] = cmeta.summary.covered_lines / cmeta.summary.num_statements * 100
+                    files[cfile] = cmeta
+                    -- Reset variables
+                    cfile = nil
+                    cmeta = nil
+                elseif line:match("SF:.+") then
+                    -- SF:<absolute path to the source file>
+                    local sf = line:gsub("SF:", "")
+                    -- Resolve the SF path relative to the parent path
+                    local sf_path = Path:new(parent_path):joinpath(sf)
+                    -- Rewrite the source file path to match the actual path relative to cwd
+                    local relative_path = sf_path:make_relative()
+                    cfile = relative_path
+                    cmeta = M.new_file_meta()
+                elseif line:match("^DA:%d+,%d+,?.*") and cmeta ~= nil then
+                    -- DA:<line number>,<execution count>[,<checksum>]
+                    local ls, ns = line:match("DA:(%d+),(%d+),?.*")
+                    local l, n = tonumber(ls, 10), tonumber(ns, 10)
+                    if n > 0 then
+                        table.insert(cmeta.executed_lines, l)
+                    else
+                        table.insert(cmeta.missing_lines, l)
+                        cmeta.summary.missing_lines = cmeta.summary.missing_lines + 1
+                    end
+                elseif line:match("^BRDA:%d+,%d+,%d+,(%d+|-)") and cmeta ~= nil then
+                    -- BRDA:<line number>,<block number>,<branch number>,<taken>
+                    -- Block number and branch number are gcc internal IDs for the branch.
+                    -- Taken is either '-' if the basic block containing the branch was never
+                    -- executed or a number indicating how often that branch was taken.
+                    local ls, ns = line:match("^BRDA:(%d+),%d+,%d+,(%d+|-)")
+                    local l = tonumber(ls, 10)
+                    --- @type integer?
+                    local n = 0
+                    if ns ~= '-' then
+                        n = tonumber(ns, 10)
+                    end
+                    if n == 0 then
+                        -- lcov uses internal ids for branch blocks and branch numbers...
+                        -- it may be possible to map these to line numbers but only the `from` branch number is used currently anyway
+                        table.insert(cmeta.missing_branches, { l, -1 })
+                    end
+                elseif line:match("^BRF:%d+") and cmeta ~= nil then
+                    -- BRF:<number of branches found>
+                    local brf = tonumber(line:gsub("BRF:", ""), 10)
+                    cmeta.summary.num_branches = brf
+                elseif line:match("^BRH:%d+") and cmeta ~= nil then
+                    -- BRH:<number of branches hit>
+                    if cmeta.summary.num_branches ~= nil then
+                        local brh = tonumber(line:gsub("BRH:", ""), 10)
+                        cmeta.summary.num_partial_branches = cmeta.summary.num_branches - brh
+                    end
+                elseif line:match("LH:%d+") and cmeta ~= nil then
+                    -- LH:<number of lines with a non-zero execution count>
+                    local lh = tonumber(line:gsub("LH:", ""), 10)
+                    cmeta.summary["covered_lines"] = lh
+                elseif line:match("LF:%d+") and cmeta ~= nil then
+                    -- LF:<number of instrumented lines>
+                    local lf = tonumber(line:gsub("LF:", ""), 10)
+                    cmeta.summary["num_statements"] = lf
+                else
+                    -- Everything else is uninteresting, just move on...
+                end
             end
-            if n == 0 then
-                -- lcov uses internal ids for branch blocks and branch numbers...
-                -- it may be possible to map these to line numbers but only the `from` branch number is used currently anyway
-                table.insert(cmeta.missing_branches, { l, -1 })
-            end
-        elseif line:match("^BRF:%d+") and cmeta ~= nil then
-            -- BRF:<number of branches found>
-            local brf = tonumber(line:gsub("BRF:", ""), 10)
-            cmeta.summary.num_branches = brf
-        elseif line:match("^BRH:%d+") and cmeta ~= nil then
-            -- BRH:<number of branches hit>
-            if cmeta.summary.num_branches ~= nil then
-                local brh = tonumber(line:gsub("BRH:", ""), 10)
-                cmeta.summary.num_partial_branches = cmeta.summary.num_branches - brh
-            end
-        elseif line:match("LH:%d+") and cmeta ~= nil then
-            -- LH:<number of lines with a non-zero execution count>
-            local lh = tonumber(line:gsub("LH:", ""), 10)
-            cmeta.summary["covered_lines"] = lh
-        elseif line:match("LF:%d+") and cmeta ~= nil then
-            -- LF:<number of instrumented lines>
-            local lf = tonumber(line:gsub("LF:", ""), 10)
-            cmeta.summary["num_statements"] = lf
-        else
-            -- Everything else is uninteresting, just move on...
         end
+    else
+        vim.notify("No lcov.info files found", vim.log.levels.INFO)
     end
 end
 
@@ -123,9 +145,7 @@ end
 M.report_to_table = function(path, parser)
     --- @type table<string, FileCoverage>
     local files = {}
-
     parser(path, files)
-
     --- @type CoverageSummary
     local totals = {
         num_statements = 0,
@@ -140,7 +160,6 @@ M.report_to_table = function(path, parser)
         totals.excluded_lines = totals.excluded_lines + meta.summary.excluded_lines
     end
     totals.percent_covered = totals.covered_lines / totals.num_statements * 100
-
     return { meta = {}, totals = totals, files = files }
 end
 
@@ -155,7 +174,6 @@ end
 --- @param path Path
 M.cobertura_to_table = function(path, path_mappings)
     local cobertura_parser = require("coverage.parsers.corbertura")
-
     return M.report_to_table(path, function(p, f)
       return cobertura_parser(p, f, path_mappings or {})
     end)
@@ -178,5 +196,4 @@ M.get_coverage_file = function(file_configuration)
     return file_configuration
   end
 end
-
 return M

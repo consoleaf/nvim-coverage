@@ -16,7 +16,9 @@ M.summary = common.summary
 M.load = function(callback)
     local javascript_config = config.opts.lang.javascript
     local p = Path:new(util.get_coverage_file(javascript_config.coverage_file))
-    if not p:exists() then
+    local fd_command = "fd --no-ignore -t f --full-path " .. p.filename
+    local fd_output = vim.fn.systemlist(fd_command)
+    if #fd_output == 0 then
         vim.notify("No coverage file exists.", vim.log.levels.INFO)
         return
     end
