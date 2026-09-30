@@ -34,7 +34,8 @@ end
 
 --- Loads a coverage report but does not place signs.
 --- @param place boolean true to immediately place signs
-M.load = function(place)
+--- @param silent boolean true to suppress the "No coverage file exists." notification
+M.load = function(place, silent)
     local ftype = vim.bo.filetype
 
     local ok, lang = pcall(require, "coverage.languages." .. ftype)
@@ -44,7 +45,19 @@ M.load = function(place)
     end
 
     local load_lang = function()
-        lang.load(function(result)
+        -- Language modules notify synchronously inside lang.load(), so a scoped
+        -- shim around vim.notify is enough to suppress the missing-file notice
+        -- without touching every language module.
+        local orig_notify = vim.notify
+        if silent then
+            vim.notify = function(msg, level, opts)
+                if level == vim.log.levels.INFO and msg == "No coverage file exists." then
+                    return
+                end
+                return orig_notify(msg, level, opts)
+            end
+        end
+        local ok, err = pcall(lang.load, function(result)
             if config.opts.load_coverage_cb ~= nil then
                 vim.schedule(function()
                     config.opts.load_coverage_cb(ftype)
@@ -58,6 +71,10 @@ M.load = function(place)
                 signs.cache(sign_list)
             end
         end)
+        vim.notify = orig_notify
+        if not ok then
+            error(err)
+        end
     end
 
     local lang_config = config.opts.lang[ftype]
